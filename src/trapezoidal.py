@@ -1,50 +1,31 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+import logging
+from typing import List, Sequence, Tuple
 
-import numpy as np
-from sympy import Eq, Symbol, symbols, solve
+from sympy import Eq, Symbol, solve, symbols
 
+from .base import (
+    Phase,
+    TrajectoryInputs,
+    TrajectoryParameters,
+    TrajectoryResult,
+)
 
-@dataclass(frozen=True)
-class TrajectoryParameters:
-    a_max: float
-    a_min: float
-    v_cruise: float
-
-
-@dataclass(frozen=True)
-class TrajectoryInputs:
-    v_initial: float
-    v_final: float
-    delta_distance: float
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
-@dataclass(frozen=True)
-class Phase:
-    duration: float
-    acceleration: Optional[float]
-
-
-@dataclass(frozen=True)
-class TrajectoryResult:
-    parameters: TrajectoryParameters
-    inputs: TrajectoryInputs
-    phases: List[Phase]
-
-    @property
-    def total_time(self) -> float:
-        """
-        Calculate the total duration of the trajectory.
-        
-        Returns:
-            Sum of all phase durations.
-        """
-        return sum(phase.duration for phase in self.phases)
-
-
-class TrajectoryGenerator:
+class TrapezoidalTrajectoryGenerator:
+    """
+    Generates trapezoidal velocity profile trajectories.
+    
+    A trapezoidal trajectory consists of three phases:
+    1. Acceleration phase: constant acceleration from v_initial towards v_cruise
+    2. Cruise phase: constant velocity at v_cruise (may be zero duration)
+    3. Deceleration phase: constant acceleration from v_cruise to v_final
+    """
+    
     def __init__(self, parameters: TrajectoryParameters) -> None:
         """
         Initialize the trajectory generator with physical constraints.
@@ -91,11 +72,18 @@ class TrajectoryGenerator:
         v_f = inputs.v_final
         delta_d = inputs.delta_distance
 
+        # Determine acceleration directions based on initial/final velocities
         a1 = params.a_min if v_i > params.v_cruise else params.a_max
         a3 = params.a_max if v_f > params.v_cruise else params.a_min
 
+        logger.info("="*70)
+        logger.info(f"Solving trapezoidal: v_i={v_i:.1f}, v_f={v_f:.1f}, Δd={delta_d:.1f}")
+        logger.info(f"  a1={a1:.2f}, a3={a3:.2f}, v_cruise={params.v_cruise:.1f}")
+
         t1, t2, t3 = self._solve_phases(a1, a3, v_i, v_f, delta_d)
 
+        # Validate solution
+        logger.info(f"\nValidating solution:")
         v_mid_check = v_i + a1 * t1
         v_end_check = v_mid_check + a3 * t3
         d1_check = 0.5 * (v_i + v_mid_check) * t1
@@ -103,14 +91,37 @@ class TrajectoryGenerator:
         d3_check = 0.5 * (v_mid_check + v_end_check) * t3
         total_distance_check = d1_check + d2_check + d3_check
 
-        if abs(v_end_check - v_f) > 1e-6 or abs(total_distance_check - delta_d) > 1e-6:
-            raise ValueError("No valid trajectory satisfies the requested constraints.")
+        logger.info(f"  v_mid={v_mid_check:.6f}, v_end={v_end_check:.6f}, v_f={v_f:.6f}")
+        logger.info(f"  d1={d1_check:.6f}, d2={d2_check:.6f}, d3={d3_check:.6f}")
+        logger.info(f"  total_distance={total_distance_check:.6f}, target={delta_d:.6f}")
+        logger.info(f"  v_end error: {abs(v_end_check - v_f):.9f}")
+        logger.info(f"  distance error: {abs(total_distance_check - delta_d):.9f}")
 
-        phases: List[Phase] = [
-            Phase(duration=t1, acceleration=a1),
-            Phase(duration=t2, acceleration=None),
-            Phase(duration=t3, acceleration=a3),
-        ]
+        if abs(v_end_check - v_f) > 1e-6 or abs(total_distance_check - delta_d) > 1e-6:
+            logger.info("  ✗ Validation failed!")
+            raise ValueError("No valid trajectory satisfies the requested constraints.")
+        
+        logger.info("  ✓ Validation passed!")
+
+        phases: List[Phase] = []
+        
+        # Phase 1: Acceleration
+        if t1 > 1e-9:
+            phases.append(Phase(duration=t1, acceleration=a1))
+        
+        # Phase 2: Cruise (only if duration > 0)
+        if t2 > 1e-9:
+            phases.append(Phase(duration=t2, velocity=params.v_cruise))
+        elif t2 < -1e-9:
+            # This shouldn't happen, but log it if it does
+            logger.warning(f"Negative cruise phase duration detected: t2={t2}")
+        
+        # Phase 3: Deceleration
+        if t3 > 1e-9:
+            phases.append(Phase(duration=t3, acceleration=a3))
+        
+        logger.info(f"Created {len(phases)} active phases (t1={t1:.3f}, t2={t2:.3f}, t3={t3:.3f})")
+        
         return TrajectoryResult(parameters=params, inputs=inputs, phases=phases)
 
     def _solve_phases(
@@ -168,18 +179,35 @@ class TrajectoryGenerator:
         ]
         
         for constraint, context in constraints:
+            logger.info(f"\nAttempt: {context}")
+            logger.info(f"  Constraint: {constraint}")
             equations = base_equations + (constraint,)
             raw_solutions = solve(equations, (t1, t2, t3), dict=True)
+            
             if not raw_solutions:
+                logger.info(f"  No solutions found")
                 continue
 
-            solution = self._select_solution(
-                raw_solutions,
-                (t1, t2, t3),
-                require_non_negative=True,
-            )
-            return solution
+            logger.info(f"  Found {len(raw_solutions)} solution(s)")
+            
+            try:
+                solution = self._select_solution(
+                    raw_solutions,
+                    (t1, t2, t3),
+                    require_non_negative=True,
+                )
+                logger.info(f"  Solution: t1={solution[0]:.3f}, t2={solution[1]:.3f}, t3={solution[2]:.3f}")
+                
+                # Check if cruise speed is actually reached
+                v_mid_actual = v_i + a1 * solution[0]
+                logger.info(f"  v_mid_actual={v_mid_actual:.3f}, v_cruise={params.v_cruise:.1f}")
+                
+                return solution
+            except ValueError as e:
+                logger.info(f"  Solution selection failed: {e}")
+                continue
 
+        logger.info("\n✗ No valid solution found")
         raise ValueError("No real solution found for the trajectory constraints.")
 
     @staticmethod
@@ -213,93 +241,41 @@ class TrajectoryGenerator:
         """
         valid_candidates: List[Tuple[float, ...]] = []
         
-        for candidate in solutions:
+        for idx, candidate in enumerate(solutions):
+            logger.info(f"    Candidate {idx+1}: {candidate}")
             numeric_values: List[float] = []
             all_real = True
             for symbol in symbol_order:
                 value = candidate[symbol]
                 evaluated = complex(value.evalf())
                 if abs(evaluated.imag) > tolerance:
+                    logger.info(f"      Has imaginary part: {evaluated}")
                     all_real = False
                     break
                 numeric_values.append(float(evaluated.real))
 
             if not all_real:
+                logger.info(f"      Rejected: not real")
                 continue
+
+            logger.info(f"      Values: {numeric_values}")
 
             if require_non_negative:
                 min_component = min(numeric_values)
                 if min_component < -tolerance:
+                    logger.info(f"      Rejected: has negative value {min_component:.6f}")
                     continue
                 numeric_values = [max(0.0, value) for value in numeric_values]
 
             valid_candidates.append(tuple(numeric_values))
+            logger.info(f"      Accepted as valid candidate")
 
         if not valid_candidates:
+            logger.info(f"    No valid candidates found")
             raise ValueError("No real solution found for the trajectory constraints.")
 
         # Return the candidate with the minimum sum of all time components
-        return min(valid_candidates, key=sum)
-
-
-def compute_profiles(result: TrajectoryResult, resolution: int = 1000) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute position, velocity, and acceleration profiles over time for a trajectory.
-    
-    Generates arrays of time-discretized values by integrating through each phase:
-    - Acceleration phases: constant acceleration applied
-    - Cruise phases: constant velocity (v_cruise)
-    
-    Args:
-        result: TrajectoryResult containing the phases and parameters.
-        resolution: Number of time points to sample (default: 1000).
-        
-    Returns:
-        Tuple of (time, position, velocity, acceleration) arrays, each of length resolution.
-        
-    Raises:
-        ValueError: If total trajectory duration is non-positive.
-    """
-    durations = np.array([phase.duration for phase in result.phases], dtype=float)
-    total_time = durations.sum()
-    if total_time <= 0.0:
-        raise ValueError("Total trajectory duration must be positive.")
-
-    timeline = np.linspace(0.0, total_time, num=resolution)
-    position = np.zeros_like(timeline)
-    velocity = np.zeros_like(timeline)
-    acceleration = np.zeros_like(timeline)
-
-    phase_start_times = np.cumsum(np.insert(durations, 0, 0.0))
-    current_velocity = result.inputs.v_initial
-    current_position = 0.0
-
-    for idx, phase in enumerate(result.phases):
-        start_time = phase_start_times[idx]
-        end_time = phase_start_times[idx + 1]
-        mask = (timeline >= start_time) & (timeline <= end_time)
-        local_time = timeline[mask] - start_time
-
-        if phase.acceleration is None:
-            if not mask.any():
-                continue
-            if phase.duration <= 0.0:
-                velocity[mask] = current_velocity
-                position[mask] = current_position
-                acceleration[mask] = 0.0
-                continue
-            velocity[mask] = result.parameters.v_cruise
-            position[mask] = current_position + result.parameters.v_cruise * local_time
-            acceleration[mask] = 0.0
-            current_velocity = result.parameters.v_cruise
-        else:
-            a = phase.acceleration
-            velocity[mask] = current_velocity + a * local_time
-            position[mask] = current_position + current_velocity * local_time + 0.5 * a * local_time**2
-            acceleration[mask] = a
-
-        current_position = position[mask][-1] if mask.any() else current_position
-        current_velocity = velocity[mask][-1] if mask.any() else current_velocity
-
-    return timeline, position, velocity, acceleration
+        best = min(valid_candidates, key=sum)
+        logger.info(f"    Selected best candidate: {best} (sum={sum(best):.3f})")
+        return best
 
