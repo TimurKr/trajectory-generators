@@ -132,6 +132,14 @@ def main() -> int:
     if not run_scurve_test("Low Jerk (Soft S-curve)", params, inputs):
         all_passed = False
     
+    # Test 11: High initial velocity (tests consecutive duplicate phase detection)
+    # When v_initial > v_cruise, the system decelerates, which can cause
+    # consecutive phases to have identical profiles (e.g., both with j_min)
+    params = TrajectoryParameters(a_max=4.0, a_min=-3.0, v_cruise=50.0, j_max=1.0, j_min=-1.0)
+    inputs = TrajectoryInputs(v_initial=80.0, v_final=0.0, delta_distance=2000.0, a_initial=0.0, a_final=0.0)
+    if not run_scurve_test("High Initial Velocity (Deceleration)", params, inputs):
+        all_passed = False
+    
     # Final summary
     print(f"\n{'='*70}")
     if all_passed:

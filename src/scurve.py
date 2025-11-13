@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from itertools import combinations
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from sympy import Eq, Symbol, solve, symbols
 
@@ -16,6 +17,26 @@ from .base import (
 # Configure logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+@dataclass
+class PhaseSymbolic:
+    """Symbolic representation of a phase during trajectory solving."""
+    index: int  # 0-6 for phases 1-7
+    time_symbol: Symbol
+    jerk: Optional[float] = None
+    acceleration: Optional[float] = None
+    velocity: Optional[float] = None
+    
+    # Symbolic expressions (computed during solving)
+    accel_start: Any = None
+    accel_end: Any = None
+    velocity_start: Any = None
+    velocity_end: Any = None
+    distance: Any = None
+    
+    def get_profile_key(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Get a key representing the phase profile (jerk, accel, velocity)."""
+        return (self.jerk, self.acceleration, self.velocity)
 
 class SCurveTrajectoryGenerator:
     """
@@ -186,6 +207,132 @@ class SCurveTrajectoryGenerator:
         
         return phases
 
+    def _create_symbolic_phases(
+        self, phase_templates: List[Phase], v_i: float, a_i: float
+    ) -> List[PhaseSymbolic]:
+        """Create symbolic phase objects from templates."""
+        t1, t2, t3, t4, t5, t6, t7 = symbols("t1 t2 t3 t4 t5 t6 t7", real=True)
+        time_symbols = [t1, t2, t3, t4, t5, t6, t7]
+        
+        symbolic_phases = []
+        for i, (template, t_sym) in enumerate(zip(phase_templates, time_symbols)):
+            phase = PhaseSymbolic(
+                index=i,
+                time_symbol=t_sym,
+                jerk=template.jerk,
+                acceleration=template.acceleration,
+                velocity=template.velocity
+            )
+            symbolic_phases.append(phase)
+        
+        # Set initial conditions for first phase
+        symbolic_phases[0].accel_start = a_i
+        symbolic_phases[0].velocity_start = v_i
+        
+        return symbolic_phases
+    
+    def _compute_phase_expressions(self, phases: List[PhaseSymbolic]) -> None:
+        """Compute symbolic expressions for acceleration, velocity, and distance through all phases."""
+        for i, phase in enumerate(phases):
+            t = phase.time_symbol
+            
+            # Get starting conditions from previous phase (or use initial if first phase)
+            if i == 0:
+                a_start = phase.accel_start
+                v_start = phase.velocity_start
+            else:
+                a_start = phases[i-1].accel_end
+                v_start = phases[i-1].velocity_end
+            
+            phase.accel_start = a_start
+            phase.velocity_start = v_start
+            
+            # Compute end conditions based on phase type
+            if phase.jerk is not None:
+                # Jerk phase
+                phase.accel_end = a_start + phase.jerk * t
+                phase.velocity_end = v_start + a_start * t + 0.5 * phase.jerk * t**2
+                phase.distance = v_start * t + 0.5 * a_start * t**2 + (1.0/6.0) * phase.jerk * t**3
+            elif phase.acceleration is not None:
+                # Constant acceleration phase
+                phase.accel_end = a_start  # Acceleration doesn't change
+                phase.velocity_end = v_start + a_start * t
+                phase.distance = v_start * t + 0.5 * a_start * t**2
+            elif phase.velocity is not None:
+                # Constant velocity phase (cruise)
+                phase.accel_end = a_start  # Should be 0
+                phase.velocity_end = v_start  # Should equal phase.velocity
+                phase.distance = v_start * t
+            else:
+                # Shouldn't happen
+                phase.accel_end = a_start
+                phase.velocity_end = v_start
+                phase.distance = 0
+    
+    def _build_constraints(
+        self, 
+        symbolic_phases: List[PhaseSymbolic],
+        phase_templates: List[Phase],
+        skipped_phases: Set[str],
+        a_f: float,
+        v_f: float,
+        delta_d: float,
+    ) -> List[Eq]:
+        """Build constraint equations based on which phases are active."""
+        constraints = [
+            Eq(symbolic_phases[-1].accel_end, a_f),  # Final acceleration
+            Eq(symbolic_phases[-1].velocity_end, v_f),  # Final velocity
+            Eq(sum(p.distance for p in symbolic_phases), delta_d),  # Total distance
+        ]
+        
+        # Phase 2 (index 1): constant accel - should reach target acceleration
+        if 't2' not in skipped_phases:
+            constraints.append(Eq(symbolic_phases[0].accel_end, phase_templates[1].acceleration))
+        
+        # Phase 4 (index 3): cruise - should reach cruise velocity with zero acceleration
+        if 't4' not in skipped_phases:
+            constraints.append(Eq(symbolic_phases[2].accel_end, 0.0))
+            constraints.append(Eq(symbolic_phases[2].velocity_end, phase_templates[3].velocity))
+        
+        # Phase 6 (index 5): constant accel - should reach target acceleration
+        if 't6' not in skipped_phases:
+            constraints.append(Eq(symbolic_phases[4].accel_end, phase_templates[5].acceleration))
+        
+        # Add zero constraints for skipped phases
+        for phase_name in skipped_phases:
+            phase_idx = int(phase_name[1]) - 1
+            constraints.append(Eq(symbolic_phases[phase_idx].time_symbol, 0.0))
+            
+            # If 2 phases around the skipped phase have the same profile, set their times to be equal
+            if symbolic_phases[phase_idx-1].get_profile_key() == symbolic_phases[phase_idx + 1].get_profile_key():
+                constraints.append(Eq(symbolic_phases[phase_idx-1].time_symbol, symbolic_phases[phase_idx + 1].time_symbol))
+        
+        return constraints
+    
+    def _validate_solution_simple(
+        self,
+        symbolic_phases: List[PhaseSymbolic],
+        times: Tuple[float, ...],
+        v_f: float,
+        a_f: float,
+        delta_d: float,
+        tolerance: float = 1e-4,
+    ) -> bool:
+        """Validate solution by substituting times into symbolic expressions."""
+        substitutions = {p.time_symbol: t for p, t in zip(symbolic_phases, times)}
+        
+        final_velocity = float(symbolic_phases[-1].velocity_end.evalf(subs=substitutions))
+        final_accel = float(symbolic_phases[-1].accel_end.evalf(subs=substitutions))
+        total_distance = float(sum(p.distance for p in symbolic_phases).evalf(subs=substitutions))
+        
+        velocity_error = abs(final_velocity - v_f)
+        accel_error = abs(final_accel - a_f)
+        distance_error = abs(total_distance - delta_d)
+        
+        return (velocity_error < tolerance and 
+                accel_error < tolerance and 
+                distance_error < tolerance)
+
     def _solve_phases(
         self,
         v_i: float,
@@ -200,210 +347,83 @@ class SCurveTrajectoryGenerator:
         Strategy:
         1. First attempt: solve with all 7 phases active
         2. If solution has negative times, try constraining phases to zero
-        3. Common constraints: t4=0 (no cruise), t2=0 or t6=0 (no constant accel)
+        3. Detect underdetermined cases (consecutive phases with same profile)
         
-        Args:
-            phase_templates: List of 7 Phase objects with jerks/accels/velocities set, durations=0
-            v_i: Initial velocity
-            v_f: Final velocity
-            a_i: Initial acceleration
-            a_f: Final acceleration
-            delta_d: Total distance to travel
-            
         Returns:
             List of 7 Phase objects with durations filled in.
             
         Raises:
             ValueError: If no valid solution is found.
         """
-
-        phases = self._determine_phase_structure(v_i, v_f, a_i, a_f)
+        phase_templates = self._determine_phase_structure(v_i, v_f, a_i, a_f)
         
-        # Extract jerks and accelerations from phase templates
-        j1 = phases[0].jerk
-        a2 = phases[1].acceleration
-        j3 = phases[2].jerk
-        v_cruise = phases[3].velocity
-        j5 = phases[4].jerk
-        a6 = phases[5].acceleration
-        j7 = phases[6].jerk
+        # Create symbolic phase objects
+        symbolic_phases = self._create_symbolic_phases(phase_templates, v_i, a_i)
         
-        # Define symbolic variables
-        t1, t2, t3, t4, t5, t6, t7 = symbols("t1 t2 t3 t4 t5 t6 t7", real=True)
-        
-        # Build the equations for all 7 phases
-        # Track acceleration through phases
-        a1_end = a_i + j1 * t1
-        a2_end = a1_end
-        a3_end = a2_end + j3 * t3
-        a4_end = a3_end
-        a5_end = a4_end + j5 * t5
-        a6_end = a5_end
-        a7_end = a6_end + j7 * t7
-        
-        # Track velocity through phases
-        v1_end = v_i + a_i * t1 + 0.5 * j1 * t1**2
-        v2_end = v1_end + a1_end * t2
-        v3_end = v2_end + a2_end * t3 + 0.5 * j3 * t3**2
-        v4_end = v3_end
-        v5_end = v4_end + a4_end * t5 + 0.5 * j5 * t5**2
-        v6_end = v5_end + a5_end * t6
-        v7_end = v6_end + a6_end * t7 + 0.5 * j7 * t7**2
-        
-        # Track distance through phases
-        d1 = v_i * t1 + 0.5 * a_i * t1**2 + (1.0/6.0) * j1 * t1**3
-        d2 = v1_end * t2 + 0.5 * a1_end * t2**2
-        d3 = v2_end * t3 + 0.5 * a2_end * t3**2 + (1.0/6.0) * j3 * t3**3
-        d4 = v3_end * t4 
-        d5 = v4_end * t5 + 0.5 * a4_end * t5**2 + (1.0/6.0) * j5 * t5**3
-        d6 = v5_end * t6 + 0.5 * a5_end * t6**2
-        d7 = v6_end * t7 + 0.5 * a6_end * t7**2 + (1.0/6.0) * j7 * t7**3
-        
-        # Base equations (always apply)
-        base_equations = [
-            Eq(a7_end, a_f),  # Final acceleration constraint
-            Eq(v7_end, v_f),  # Final velocity constraint
-            Eq(d1 + d2 + d3 + d4 + d5 + d6 + d7, delta_d),  # Distance constraint
-        ]
-        
-        # Try different constraint combinations
-        # Priority: fewest constraints first (try all phases active)
-        constraint_sets = [
-            # All phases active with specific velocity/acceleration constraints
-            [
-                Eq(a1_end, a2),  # Phase 1 reaches target accel
-                Eq(a3_end, 0.0),  # Phase 3 brings accel to 0
-                Eq(v3_end, v_cruise),  # Reach cruise velocity
-                Eq(a5_end, a6),  # Phase 5 reaches target decel
-            ],
-            # No cruise phase (t4 = 0)
-            [
-                Eq(t4, 0.0),
-                Eq(a1_end, a2),
-                Eq(a3_end, 0.0),
-                Eq(a5_end, a6),
-            ],
-            # No constant acceleration in first half (t2 = 0)
-            [
-                Eq(t2, 0.0),
-                Eq(a3_end, 0.0),
-                Eq(v3_end, v_cruise),
-                Eq(a5_end, a6),
-            ],
-            # No constant acceleration in second half (t6 = 0)
-            [
-                Eq(t6, 0.0),
-                Eq(a1_end, a2),
-                Eq(a3_end, 0.0),
-                Eq(v3_end, v_cruise),
-            ],
-            # No cruise, no constant accel in first half
-            [
-                Eq(t2, 0.0),
-                Eq(t4, 0.0),
-                Eq(a3_end, 0.0),
-                Eq(a5_end, a6),
-            ],
-            # No cruise, no constant accel in second half
-            [
-                Eq(t4, 0.0),
-                Eq(t6, 0.0),
-                Eq(a1_end, a2),
-                Eq(a3_end, 0.0),
-            ],
-            # No constant accel phases at all
-            [
-                Eq(t2, 0.0),
-                Eq(t4, 0.0),
-                Eq(t6, 0.0),
-                Eq(a3_end, 0.0),
-            ],
-            # Minimal constraints - just structural
-            [
-                Eq(t2, 0.0),
-                Eq(t4, 0.0),
-                Eq(t6, 0.0),
-            ],
-        ]
-        
-        all_symbols = (t1, t2, t3, t4, t5, t6, t7)
-        
-        # Try solving with full constraints first
         logger.info("="*70)
         logger.info(f"Solving S-curve: v_i={v_i:.1f}, v_f={v_f:.1f}, a_i={a_i:.1f}, a_f={a_f:.1f}, Δd={delta_d:.1f}")
-        logger.info(f"Jerks: j1={j1:.2f}, j3={j3:.2f}, j5={j5:.2f}, j7={j7:.2f}")
-        logger.info("\nAttempt 1: Full 7-phase solution")
         
-        full_constraints = constraint_sets[0]  # All phases active
-        try:
-            equations = base_equations + full_constraints
-            raw_solutions = solve(equations, all_symbols, dict=True)
+        # Compute symbolic expressions for each phase
+        self._compute_phase_expressions(symbolic_phases)
+        
+        # Phases that can be skipped (constant accel/velocity phases)
+        skippable_phases = {'t2', 't4', 't6'}
+        skipped_phases = set()
+        attempt_num = 1
+        all_symbols = tuple(p.time_symbol for p in symbolic_phases)
+        
+        while True:
+            # Build constraints
+            equations = self._build_constraints(symbolic_phases, phase_templates, skipped_phases, a_f, v_f, delta_d)
+
+            # Log attempt
+            logger.info(f"\nAttempt {attempt_num}: {'All phases active' if not skipped_phases else f'Skipped phases: {sorted(skipped_phases)}'}")
             
-            if raw_solutions:
-                logger.info(f"  Found {len(raw_solutions)} solution(s)")
-                # Analyze the best solution
-                best_sol, negative_phases = self._analyze_solution_for_negatives(raw_solutions, all_symbols)
-                
-                if not negative_phases:
-                    logger.info(f"  Times: t={[f'{t:.3f}' for t in best_sol]}")
-                    if self._validate_solution(best_sol, v_i, v_f, a_i, a_f, delta_d, j1, j3, j5, j7, a2, a6):
-                        logger.info("  ✓ Valid solution!")
-                        return self._create_phases_with_durations(phases, best_sol)
-                else:
-                    logger.info(f"  Negative phases detected: {sorted(negative_phases)}")
-                    logger.info(f"  Times: t={[f'{t:.3f}' for t in best_sol]}")
-                    
-                    # Try again with those phases set to zero
-                    attempt_num = 2
-                    for phase in sorted(negative_phases):
-                        logger.info(f"\nAttempt {attempt_num}: Setting {phase} = 0")
-                        attempt_num += 1
-                        
-                        # Find the appropriate constraint set
-                        phase_to_idx = {'t2': 2, 't4': 1, 't6': 3}
-                        if phase in phase_to_idx:
-                            idx = phase_to_idx[phase]
-                            constraints_to_try = constraint_sets[idx]
-                            
-                            try:
-                                equations = base_equations + constraints_to_try
-                                raw_solutions = solve(equations, all_symbols, dict=True)
-                                if raw_solutions:
-                                    solution = self._select_solution(raw_solutions, all_symbols, require_non_negative=True)
-                                    logger.info(f"  Times: t={[f'{t:.3f}' for t in solution]}")
-                                    if self._validate_solution(solution, v_i, v_f, a_i, a_f, delta_d, j1, j3, j5, j7, a2, a6):
-                                        logger.info("  ✓ Valid solution!")
-                                        return self._create_phases_with_durations(phases, solution)
-                            except (ValueError, Exception) as e:
-                                logger.info(f"  Failed: {e}")
-        except Exception as e:
-            logger.info(f"  Failed: {e}")
-        
-        # Try other constraint sets
-        logger.info("\nTrying fallback constraints...")
-        for attempt_num, additional_constraints in enumerate(constraint_sets[1:], start=2):
-            equations = base_equations + additional_constraints
             try:
                 raw_solutions = solve(equations, all_symbols, dict=True)
+                
                 if not raw_solutions:
-                    continue
+                    logger.info("  No solutions found (possibly underdetermined)")
+                    break
                 
-                solution = self._select_solution(
-                    raw_solutions,
-                    all_symbols,
-                    require_non_negative=True,
-                )
+                logger.info(f"  Found {len(raw_solutions)} solution(s):")
+                for idx, sol in enumerate(raw_solutions, 1):
+                    readable = ', '.join(f"{str(k)}={float(v):.4f}" for k, v in sol.items())
+                    logger.info(f"    Solution {idx}: {readable}")
                 
-                logger.info(f"Attempt {attempt_num}: t={[f'{t:.3f}' for t in solution]}")
+                # Try to select a non-negative solution first
+                try:
+                    solution = self._select_solution(raw_solutions, all_symbols, require_non_negative=True)
+                    if self._validate_solution_simple(symbolic_phases, solution, v_f, a_f, delta_d):
+                        logger.info("  ✓ Valid solution!")
+                        return self._create_phases_with_durations(phase_templates, solution)
+                except ValueError:
+                    pass
+
+                # Otherwise, select best solution (may have negatives)
+                solution = self._select_solution(raw_solutions, all_symbols, require_non_negative=False)
+                logger.info(f"  Times: {[f'{t:.3f}' for t in solution]}")
                 
-                # Validate solution
-                if self._validate_solution(solution, v_i, v_f, a_i, a_f, delta_d, j1, j3, j5, j7, a2, a6):
-                    logger.info("  ✓ Valid!")
-                    return self._create_phases_with_durations(phases, solution)
-            except (ValueError, Exception):
-                continue
+                # Check for negative phases
+                negative_phases = {f't{i+1}' for i, t in enumerate(solution) if t < -1e-9}
+                
+                if negative_phases:
+                    negative_skippable = negative_phases & skippable_phases
+                    if negative_skippable:
+                        phase_to_skip = sorted(negative_skippable)[0]
+                        skipped_phases.add(phase_to_skip)
+                        logger.info(f"  ✗ Negative phase: {sorted(negative_phases)} → skipping {phase_to_skip}")
+                        attempt_num += 1
+                        continue
+                    else:
+                        logger.info(f"  ✗ Negative non-skippable phase: {sorted(negative_phases)}")
+                        break
+                    
+            except Exception as e:
+                logger.info(f"  Failed: {e}")
+                break
         
-        logger.info("✗ No solution found")
+        logger.info("\n✗ No solution found")
         raise ValueError("No real solution found for the S-curve trajectory constraints.")
     
     def _create_phases_with_durations(
@@ -434,148 +454,6 @@ class SCurveTrajectoryGenerator:
                 phases.append(Phase(duration=duration))
         return phases
     
-    def _analyze_solution_for_negatives(
-        self,
-        raw_solutions: List[Dict],
-        symbol_order: Sequence[Symbol],
-        tolerance: float = 1e-9
-    ) -> Tuple[Tuple[float, ...], Set[str]]:
-        """
-        Analyze solutions to find best one and identify negative phases.
-        
-        Returns:
-            (solution_tuple, set_of_negative_phase_names)
-        """
-        best_solution = None
-        best_score = float('inf')
-        best_negatives = set()
-        
-        for candidate in raw_solutions:
-            values = []
-            all_real = True
-            
-            for symbol in symbol_order:
-                val = candidate[symbol]
-                evaluated = complex(val.evalf())
-                if abs(evaluated.imag) > tolerance:
-                    all_real = False
-                    break
-                values.append(float(evaluated.real))
-            
-            if not all_real:
-                continue
-            
-            # Find negative phases
-            negatives = set()
-            phase_names = ['t1', 't2', 't3', 't4', 't5', 't6', 't7']
-            for i, v in enumerate(values):
-                if v < -tolerance:
-                    negatives.add(phase_names[i])
-            
-            # Score: fewer negatives is better
-            num_neg = len(negatives)
-            abs_sum = sum(abs(v) for v in values if v < -tolerance)
-            score = (num_neg, abs_sum)
-            
-            if best_solution is None or score < best_score:
-                best_score = score
-                best_solution = tuple(max(0.0, v) for v in values)
-                best_negatives = negatives
-        
-        if best_solution is None:
-            raise ValueError("No real solutions")
-        
-        return best_solution, best_negatives
-
-    def _validate_solution(
-        self,
-        times: Tuple[float, ...],
-        v_i: float,
-        v_f: float,
-        a_i: float,
-        a_f: float,
-        delta_d: float,
-        j1: float,
-        j3: float,
-        j5: float,
-        j7: float,
-        a2: float,
-        a6: float,
-        tolerance: float = 1e-4,
-    ) -> bool:
-        """
-        Validate that a solution satisfies all constraints.
-        
-        Args:
-            times: Tuple of (t1, t2, t3, t4, t5, t6, t7)
-            v_i: Initial velocity
-            v_f: Final velocity
-            a_i: Initial acceleration
-            a_f: Final acceleration
-            delta_d: Total distance
-            j1, j3, j5, j7: Jerk values for jerk phases
-            a2, a6: Target accelerations for constant acceleration phases
-            tolerance: Numerical tolerance for validation
-            
-        Returns:
-            True if solution is valid, False otherwise.
-        """
-        t1, t2, t3, t4, t5, t6, t7 = times
-        params = self.parameters
-        
-        # Track state through all phases
-        a = a_i
-        v = v_i
-        d = 0.0
-        
-        # Phase 1: jerk
-        if t1 > 0:
-            d += v * t1 + 0.5 * a * t1**2 + (1.0/6.0) * j1 * t1**3
-            v += a * t1 + 0.5 * j1 * t1**2
-            a += j1 * t1
-        
-        # Phase 2: constant acceleration
-        if t2 > 0:
-            d += v * t2 + 0.5 * a * t2**2
-            v += a * t2
-        
-        # Phase 3: jerk
-        if t3 > 0:
-            d += v * t3 + 0.5 * a * t3**2 + (1.0/6.0) * j3 * t3**3
-            v += a * t3 + 0.5 * j3 * t3**2
-            a += j3 * t3
-        
-        # Phase 4: cruise
-        if t4 > 0:
-            d += v * t4
-        
-        # Phase 5: jerk
-        if t5 > 0:
-            d += v * t5 + 0.5 * a * t5**2 + (1.0/6.0) * j5 * t5**3
-            v += a * t5 + 0.5 * j5 * t5**2
-            a += j5 * t5
-        
-        # Phase 6: constant acceleration
-        if t6 > 0:
-            d += v * t6 + 0.5 * a * t6**2
-            v += a * t6
-        
-        # Phase 7: jerk
-        if t7 > 0:
-            d += v * t7 + 0.5 * a * t7**2 + (1.0/6.0) * j7 * t7**3
-            v += a * t7 + 0.5 * j7 * t7**2
-            a += j7 * t7
-        
-        # Check if final state matches requirements
-        velocity_error = abs(v - v_f)
-        acceleration_error = abs(a - a_f)
-        distance_error = abs(d - delta_d)
-        
-        return (
-            velocity_error < tolerance and
-            acceleration_error < tolerance and
-            distance_error < tolerance
-        )
 
     @staticmethod
     def _select_solution(
@@ -636,4 +514,3 @@ class SCurveTrajectoryGenerator:
 
         # Return the candidate with the minimum sum of all time components
         return min(valid_candidates, key=sum)
-

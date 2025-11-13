@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import List
+
+# Configure logging FIRST, before importing modules that create loggers
+# This ensures all loggers inherit the configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    force=True,  # Override any existing configuration
+)
 
 import streamlit as st
 
@@ -10,6 +19,38 @@ from utils.plotting import render_matplotlib, render_streamlit
 from src.base import TrajectoryInputs, TrajectoryParameters, TrajectoryResult
 from src.trapezoidal import TrapezoidalTrajectoryGenerator
 from src.scurve import SCurveTrajectoryGenerator
+
+class StreamlitLogHandler(logging.Handler):
+    """Custom logging handler that stores logs for UI display."""
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Store in session state if available (Streamlit context)
+            try:
+                if hasattr(st, 'session_state'):
+                    if 'log_messages' not in st.session_state:
+                        st.session_state.log_messages = []
+                    st.session_state.log_messages.append(msg)
+                    # Keep only last 200 messages
+                    if len(st.session_state.log_messages) > 200:
+                        st.session_state.log_messages.pop(0)
+            except Exception:
+                pass  # Not in Streamlit context, skip session state
+            # Always print to console (visible in terminal where Streamlit runs)
+            print(msg)
+        except Exception:
+            # Fallback: just print
+            print(self.format(record))
+
+# Add handler to root logger (this will propagate to all child loggers)
+root_logger = logging.getLogger()
+# Remove any existing handlers to avoid duplicates
+root_logger.handlers.clear()
+streamlit_handler = StreamlitLogHandler()
+streamlit_handler.setFormatter(logging.Formatter('%(message)s'))
+streamlit_handler.setLevel(logging.INFO)
+root_logger.addHandler(streamlit_handler)
+root_logger.setLevel(logging.INFO)
 
 
 DEFAULT_A_MAX = 4.0
@@ -98,8 +139,18 @@ def run_app() -> None:
     st.title("Tangential Trajectory Generator")
     st.markdown("Compare **Trapezoidal** and **S-Curve** trajectory profiles side-by-side")
 
+    # Initialize log storage if not exists
+    if 'log_messages' not in st.session_state:
+        st.session_state.log_messages = []
+
     # Sidebar: Parameters
     st.sidebar.header("Trajectory Parameters")
+    
+    # Add option to show logs and clear button
+    show_logs = st.sidebar.checkbox("Show Debug Logs", value=False)
+    if st.sidebar.button("Clear Logs"):
+        st.session_state.log_messages = []
+        st.sidebar.success("Logs cleared!")
     
     st.sidebar.subheader("Acceleration Limits")
     a_max = st.sidebar.slider(
@@ -257,6 +308,13 @@ def run_app() -> None:
     # Render plots
     render_streamlit(trapezoidal_result, scurve_result)
 
+    # Display logs if requested
+    if show_logs and st.session_state.get('log_messages'):
+        with st.expander("Debug Logs", expanded=False):
+            log_text = "\n".join(st.session_state.log_messages)
+            st.code(log_text, language=None)
+            st.caption(f"Showing {len(st.session_state.log_messages)} log messages")
+
     # Save button
     if st.button("Save comparison plot as PNG"):
         output_path = save_plot(trapezoidal_result, scurve_result)
@@ -295,3 +353,20 @@ if __name__ == "__main__":
     # If phases have negative times, iteratively constrain them to zero.
     
     run_app()
+    # parameters = TrajectoryParameters(
+    #     a_max=4.0,
+    #     a_min=-3.0,
+    #     v_cruise=100.0,
+    #     j_max=1.0,
+    #     j_min=-1.0,
+    # )
+    # inputs = TrajectoryInputs(
+    #     v_initial=90,
+    #     v_final=0.0,
+    #     a_initial=6,
+    #     a_final=0.0,
+    #     delta_distance=5000.0,
+    # )
+    # generator = SCurveTrajectoryGenerator(parameters)
+    # result = generator.generate_trajectory(inputs)
+    # print(result)

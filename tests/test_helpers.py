@@ -55,10 +55,15 @@ def validate_trajectory(
         if min_accel < result.parameters.a_min - tolerance:
             return False, f"Acceleration below a_min: {min_accel:.3f} < {result.parameters.a_min:.3f}"
     
-    # Check that velocity stays within bounds (allowing small overshoot during acceleration)
+    # Check that velocity stays within bounds (allowing for initial/final velocities to exceed cruise)
+    # The trajectory may start or end above v_cruise, which is valid
+    v_initial = result.inputs.v_initial
+    v_final = result.inputs.v_final
+    max_allowed_velocity = max(result.parameters.v_cruise, v_initial, v_final) + tolerance * 10
+    
     max_velocity = velocity.max()
-    if max_velocity > result.parameters.v_cruise + tolerance * 10:
-        return False, f"Velocity exceeds v_cruise significantly: {max_velocity:.3f} > {result.parameters.v_cruise:.3f}"
+    if max_velocity > max_allowed_velocity:
+        return False, f"Velocity exceeds maximum allowed: {max_velocity:.3f} > {max_allowed_velocity:.3f}"
     
     return True, "OK"
 

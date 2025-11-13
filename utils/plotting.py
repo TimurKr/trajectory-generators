@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -75,6 +75,9 @@ def _render_dual_profiles(
         scurve_result, resolution=resolution
     )
     
+    trapezoidal_phase_times = _phase_change_times(trapezoidal_result)
+    scurve_phase_times = _phase_change_times(scurve_result)
+
     # Create figure with 4 subplots
     fig, axes = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
     
@@ -163,6 +166,20 @@ def _render_dual_profiles(
     axes[3].legend(loc="best")
     axes[3].set_title("Jerk Profile (S-Curve only)")
     
+    # Overlay vertical lines for phase transitions
+    _add_phase_change_lines(
+        axes,
+        trapezoidal_phase_times,
+        color="blue",
+        label="Phase Change (Trapezoidal)",
+    )
+    _add_phase_change_lines(
+        axes,
+        scurve_phase_times,
+        color="orange",
+        label="Phase Change (S-Curve)",
+    )
+
     # Ensure all axes have bottom labels enabled
     for axis in axes:
         axis.tick_params(labelbottom=True)
@@ -171,3 +188,65 @@ def _render_dual_profiles(
     fig.tight_layout(rect=(0, 0, 1, 0.98))
     
     return fig
+
+
+def _phase_change_times(result: TrajectoryResult) -> list[float]:
+    """
+    Compute cumulative timestamps where phase boundaries occur.
+    
+    Args:
+        result: Trajectory result containing sequential phases.
+        
+    Returns:
+        Sorted list of times (in seconds) where one phase ends and the next begins.
+    """
+    cumulative_times: list[float] = []
+    elapsed = 0.0
+
+    for phase in result.phases[:-1]:
+        elapsed += phase.duration
+        if phase.duration <= 0.0:
+            continue
+        if cumulative_times and np.isclose(elapsed, cumulative_times[-1]):
+            continue
+        cumulative_times.append(elapsed)
+
+    return cumulative_times
+
+
+def _add_phase_change_lines(
+    axes: Iterable[plt.Axes],
+    phase_times: Iterable[float],
+    *,
+    color: str,
+    label: str,
+    linestyle: str = "--",
+    linewidth: float = 1.2,
+    alpha: float = 0.35,
+) -> None:
+    """
+    Add vertical lines marking phase transitions to each subplot axis.
+    
+    Args:
+        axes: Axes to annotate.
+        phase_times: Times where phases change.
+        color: Line color.
+        label: Legend label to use on the first axis only.
+        linestyle: Matplotlib linestyle for the vertical lines.
+        linewidth: Line width for the vertical lines.
+        alpha: Transparency for the vertical lines.
+    """
+    phase_times_list = list(phase_times)
+    if not phase_times_list:
+        return
+
+    for axis_index, ax in enumerate(axes):
+        for time_index, time in enumerate(phase_times_list):
+            ax.axvline(
+                time,
+                color=color,
+                linestyle=linestyle,
+                linewidth=linewidth,
+                alpha=alpha,
+                label=label if (axis_index == 0 and time_index == 0) else "_nolegend_",
+            )
