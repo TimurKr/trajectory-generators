@@ -1,6 +1,6 @@
 # Trajectory Generators
 
-A Streamlit application for generating and comparing **Trapezoidal** and **S-Curve** tangential trajectory profiles.
+A Streamlit application for generating and comparing **Trapezoidal** and **S-Curve** trajectory profiles.
 
 ## Features
 

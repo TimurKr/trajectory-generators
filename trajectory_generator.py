@@ -136,7 +136,7 @@ def save_plot(
 
 def run_app() -> None:
     """Main Streamlit application."""
-    st.title("Tangential Trajectory Generator")
+    st.title("Trajectory Generator")
     st.markdown("Compare **Trapezoidal** and **S-Curve** trajectory profiles side-by-side")
 
     # Initialize log storage if not exists
